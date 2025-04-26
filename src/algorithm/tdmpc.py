@@ -10,15 +10,24 @@ class TOLD(nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
-		self._encoder = h.enc(cfg)
+		self._encoder = h.enc(cfg) # size depends on whether pixel or state is used.
+		# 100 for humanoid, predicts the next latent space from the (current_latent_state + action_dimensions)
 		self._dynamics = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, cfg.latent_dim)
+		# predicts the reward from the current latent dim, action dim
 		self._reward = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, 1)
+		# maps the latent state to the action state/dim
 		self._pi = h.mlp(cfg.latent_dim, cfg.mlp_dim, cfg.action_dim)
+		#Q(s,a)- expected return from taking action a in state s. Borrowed concept from actor critic-2x values prevents overestimating in noisy env
 		self._Q1, self._Q2 = h.q(cfg), h.q(cfg)
-		self.apply(h.orthogonal_init)
+		# Q1(z, a), Q2(z, a)--> during training: Q_target = reward + discount * min(Q1', Q2')
+		# If Q is overestimated, then target_Q becomes inflated → leads to instability.
+		# target_Q = reward + gamma * min(Q1(next_z, a'), Q2(next_z, a'))  prevent the optimistic critic from misleading the actor.
+		self.apply(h.orthogonal_init) #stable training
 		for m in [self._reward, self._Q1, self._Q2]:
 			m[-1].weight.data.fill_(0)
 			m[-1].bias.data.fill_(0)
+			# common in RL algorithms like SAC or TD3 to avoid overestimation bias
+			# For reward models, it ensures outputs start near zero (neutral initial behavior).
 
 	def track_q_grad(self, enable=True):
 		"""Utility function. Enables/disables gradient tracking of Q-networks."""
@@ -31,19 +40,24 @@ class TOLD(nn.Module):
 
 	def next(self, z, a):
 		"""Predicts next latent state (d) and single-step reward (R)."""
+		# both are single step reward functions
 		x = torch.cat([z, a], dim=-1)
 		return self._dynamics(x), self._reward(x)
 
 	def pi(self, z, std=0):
-		"""Samples an action from the learned policy (pi)."""
+		"""Samples an action from the learned policy (pi), (optionally with noise)"""
+		# Input z "latent representation" is passed through pi policy network
+		# tanh squashes the output to range [-1,1]
 		mu = torch.tanh(self._pi(z))
+		# adding noise for exploration. When does the std >0? when predefined to be 0 at start of program
 		if std > 0:
 			std = torch.ones_like(mu) * std
-			return h.TruncatedNormal(mu, std).sample(clip=0.3)
+			return h.TruncatedNormal(mu, std).sample(clip=0.3) # some noise but also a cut-off to prevent going wayward
 		return mu
 
 	def Q(self, z, a):
 		"""Predict state-action value (Q)."""
+		# Q(s,a)- expected return from taking action a in state s. Except this is happening in latent space
 		x = torch.cat([z, a], dim=-1)
 		return self._Q1(x), self._Q2(x)
 
@@ -53,10 +67,18 @@ class TDMPC():
 	def __init__(self, cfg):
 		self.cfg = cfg
 		self.device = torch.device('cuda')
+		# initializes the linear scheduler
 		self.std = h.linear_schedule(cfg.std_schedule, 0)
+		# initializes the TOLD function to cuda
 		self.model = TOLD(cfg).cuda()
+		# The purpose here is to create a target model. This will later be used to train a separate NN.
 		self.model_target = deepcopy(self.model)
+		# In machine learning, especially in reinforcement learning (like DQN), target networks are used to stabilize training.
+		# The target network is a copy of the main model that's updated less frequently.
+		# By using a deep copy, the target model starts with the same parameters as the main model but remains independent.
 		self.optim = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
+		# optimizer applied to all parts of the model
+		# optimizer is applied to only a sub part/sub-parameters/sub-component of the model
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr)
 		self.aug = h.RandomShiftsAug(cfg)
 		self.model.eval()
@@ -78,14 +100,19 @@ class TDMPC():
 		self.model_target.load_state_dict(d['model_target'])
 
 	@torch.no_grad()
-	def estimate_value(self, z, actions, horizon):
+	#since only estimating/evaluating not training
+	def estimate_value(self, z, actions, horizon): # Horizon is set as 5 for all these cases--q_hat
+		# z: intial latent state, actions: a sequence of actions, horizon: how far in future to simulate
+		# provides total reward/value for taking sampled action in the latent space
 		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
 		G, discount = 0, 1
 		for t in range(horizon):
-			z, reward = self.model.next(z, actions[t])
+			z, reward = self.model.next(z, actions[t]) # reward model predicted at that step
 			G += discount * reward
 			discount *= self.cfg.discount
+			#updating discount to higher terms as it happens
 		G += discount * torch.min(*self.model.Q(z, self.model.pi(z, self.cfg.min_std)))
+		# returns 2 Q values- Q1 & Q2, then selecting the min
 		return G
 
 	@torch.no_grad()
@@ -97,20 +124,32 @@ class TDMPC():
 		step: current time step. determines e.g. planning horizon.
 		t0: whether current step is the first step of an episode.
 		"""
+		# This gives you num_pi_trajs full action sequences sampled from the learned policy —
+		# all done in latent space without touching the environment.
 		# Seed steps
-		if step < self.cfg.seed_steps and not eval_mode:
+		if step < self.cfg.seed_steps and not eval_mode: # seed steps = 5000
 			return torch.empty(self.cfg.action_dim, dtype=torch.float32, device=self.device).uniform_(-1, 1)
 
 		# Sample policy trajectories
 		obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 		horizon = int(min(self.cfg.horizon, h.linear_schedule(self.cfg.horizon_schedule, step)))
+		#  a common trick to plan shorter at first and longer as the agent becomes more confident.
 		num_pi_trajs = int(self.cfg.mixture_coef * self.cfg.num_samples)
+		# num_samples: 256* mixture_coef: 0.05 = 256 * 0.05= 12.8
+		# mixing policy-sampled and random-sampled (or noise-injected) trajectories.
+		# mixture_coef defines what fraction are taken from the current learned policy.
 		if num_pi_trajs > 0:
+			# This will store all the actions predicted by the policy over time for all sampled trajectories.
 			pi_actions = torch.empty(horizon, num_pi_trajs, self.cfg.action_dim, device=self.device)
+			# Encode observation into latent state and repeat across trajectories
 			z = self.model.h(obs).repeat(num_pi_trajs, 1)
+			# Repeat the tensor 2 times along the first dimension and 3 times along the second dimension
 			for t in range(horizon):
 				pi_actions[t] = self.model.pi(z, self.cfg.min_std)
+				# Sample actions using self.model.pi,
+				# Store actions in pi_actions[t]
 				z, _ = self.model.next(z, pi_actions[t])
+			# The z updated inside the for-loop (inside the if num_pi_trajs > 0: block) is only used locally to create better pi_actions.
 
 		# Initialize state and parameters
 		z = self.model.h(obs).repeat(self.cfg.num_samples+num_pi_trajs, 1)
@@ -119,17 +158,17 @@ class TDMPC():
 		if not t0 and hasattr(self, '_prev_mean'):
 			mean[:-1] = self._prev_mean[1:]
 
-		# Iterate CEM
-		for i in range(self.cfg.iterations):
+		# Iterate CEM : Cross entropy method
+		for i in range(self.cfg.iterations): # iteration = 3
 			actions = torch.clamp(mean.unsqueeze(1) + std.unsqueeze(1) * \
 				torch.randn(horizon, self.cfg.num_samples, self.cfg.action_dim, device=std.device), -1, 1)
 			if num_pi_trajs > 0:
 				actions = torch.cat([actions, pi_actions], dim=1)
 
 			# Compute elite actions
-			value = self.estimate_value(z, actions, horizon).nan_to_num_(0)
-			elite_idxs = torch.topk(value.squeeze(1), self.cfg.num_elites, dim=0).indices
-			elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
+			value = self.estimate_value(z, actions, horizon).nan_to_num_(0) # returns value 'G'
+			elite_idxs = torch.topk(value.squeeze(1), self.cfg.num_elites, dim=0).indices # num of elites=32, index
+			elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs] # values
 
 			# Update parameters
 			max_value = elite_value.max(0)[0]
@@ -153,8 +192,8 @@ class TDMPC():
 	def update_pi(self, zs):
 		"""Update policy using a sequence of latent states."""
 		self.pi_optim.zero_grad(set_to_none=True)
-		self.model.track_q_grad(False)
-
+		self.model.track_q_grad(False) # when set to False, it does not track gradients useful for freezing parts of the model
+		# When updating the policy network (actor), gradients for the Q-networks (critics) are often disabled:
 		# Loss is a weighted sum of Q-values
 		pi_loss = 0
 		for t,z in enumerate(zs):

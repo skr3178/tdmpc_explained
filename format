@@ -1,0 +1,7 @@
+Model-based RL setups tend to have the same components:
+
+encode observation → latent state
+rollout dynamics model
+sample actions from a learned policy
+evaluate using rewards + Q-function
+

@@ -9,6 +9,9 @@ import gym
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
+#Use DMControl environments in a Gym-compatible way.
+#Collect pixel-based or state-based data with stacked frames.
+#Use TD-MPC or other model-based RL algorithms expecting Gym environments.
 
 class ExtendedTimeStep(NamedTuple):
 	step_type: Any
@@ -16,7 +19,7 @@ class ExtendedTimeStep(NamedTuple):
 	discount: Any
 	observation: Any
 	action: Any
-
+	# checks if the step is in the first, mid or last of an episode
 	def first(self):
 		return self.step_type == StepType.FIRST
 
@@ -33,6 +36,9 @@ class ActionRepeatWrapper(dm_env.Environment):
 		self._num_repeats = num_repeats
 
 	def step(self, action):
+		#accumulates rewards Accumulates reward over num_repeats.
+		#If done occurs before the full repeat cycle, it exits early.
+		#Returns the final TimeStep with accumulated reward and discount.
 		reward = 0.0
 		discount = 1.0
 		for i in range(self._num_repeats):
@@ -58,6 +64,7 @@ class ActionRepeatWrapper(dm_env.Environment):
 
 
 class FrameStackWrapper(dm_env.Environment):
+	#Stacks the last N image frames into a single observation (used for learning from video/pixel input):
 	def __init__(self, env, num_frames, pixels_key='pixels'):
 		self._env = env
 		self._num_frames = num_frames
